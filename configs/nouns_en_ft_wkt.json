@@ -1,0 +1,14 @@
+{
+    "lang": "en",
+    "pos": "N",
+    "modes": "wkt",
+
+    "embeddings_path": "data/vectors/ft_v2_07_01_21.wv",
+    "wiktionary_dump_path": "data/wiki/enwiktionary-20210201-pages-articles-multistream.xml",
+    
+    "syn_pattern_path": null,
+    "hyp_pattern_path": null,
+
+    "train_synset_cand_count": 40,
+    "predict_synset_cand_count": 20
+}
