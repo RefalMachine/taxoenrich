@@ -121,19 +121,19 @@ class HypernymPredictModel():
         self.lang = config['lang']
         self.search_by_word = config['search_by_word']
 
-        '''
+
         self.wkt_on = config['wkt']
         global wkt
         if self.lang == 'en':
             import wiktionary_processing.utils_en as wkt
         else:
             import wiktionary_processing.utils as wkt
-        '''
+
     def _load_resources(self, config):
         self._load_thesaurus(config)
         self._load_vectors(config)
         self.G = create_graph(self.thesaurus, self.word_types, self.config['allowed_rels'])
-        #self._load_wkt(config)
+        self._load_wkt(config)
 
     def _load_thesaurus(self, config):
         print('Loading Thesaurus')
@@ -147,13 +147,13 @@ class HypernymPredictModel():
             self.vector_model = StaticVectorModel(gensim.models.KeyedVectors.load(embeddings_path))
         except:
             self.vector_model = StaticVectorModel(gensim.models.KeyedVectors.load_word2vec_format(embeddings_path, binary=False))
-    '''
+
     def _load_wkt(self, config):
         self.wiktionary = {}
         if self.wkt_on:
             print('Loading Wiktionary')
             self.wiktionary = wkt.load_wiktionary(config['wiktionary_dump_path'], self.vector_model)
-    '''
+
     def _calculate_features(self, word, definition=''):
         candidate2features = self._calculate_candidates(word, definition=definition)
         if len(candidate2features) == 0:
@@ -166,12 +166,12 @@ class HypernymPredictModel():
             synset = self.thesaurus.synsets[synset_id]
 
             init_features = self._calculate_init_features(synset_id, candidate2features)
-            #wkt_features = self._calculate_wiktionary_features(word, synset)
+            wkt_features = self._calculate_wiktionary_features(word, synset)
             synset_features = self._calculate_synset_similarity(word, synset)
 
             candidate_col.append(synset_id)
-            #features.append(init_features + wkt_features + synset_features)
-            features.append(init_features + synset_features)
+            features.append(init_features + wkt_features + synset_features)
+            #features.append(init_features + synset_features)
             if self.config['use_def']:
                 def_features = self._calculate_def_features(word, synset, definition)
                 features[-1] += def_features
@@ -186,10 +186,6 @@ class HypernymPredictModel():
             columns[f'f{i}'] = features[:,i]
 
         df = pd.DataFrame(columns)
-        #df = df.sort_values(by='f6', ascending=False)
-        #df = df.iloc[:self.topk]
-        #print(df[['word', 'cand', 'f0', 'f1', 'f2', 'f3', 'f4', 'f5', 'f6', 'f7', 'f8']].head(10))
-        #exit(1)
         return df
 
     def _calculate_def_features(self, word, synset, definition):
@@ -284,7 +280,7 @@ class HypernymPredictModel():
 
         return features
 
-    '''
+
     def _calculate_wiktionary_features(self, target_word, synset):
         # 1 feature for direct syn, 1 feature for hypo syn, 1 feature for direct hyper, 1 feature for hypo hyper
         if len(self.wiktionary) == 0:
@@ -337,7 +333,7 @@ class HypernymPredictModel():
                 features[hypo_meaning_feature_idx] = 1
 
         return features
-    '''
+
     def _calculate_synset_similarity(self, w, synset):
         f_lists = [[], [], [], []]
         for synset_word in synset.synset_words:
