@@ -17,7 +17,7 @@ class TripletLoss(nn.Module):
         if distance_type == 'mse':
             self.distance = lambda anchor, targets: (anchor - targets).pow(2).sum(1)
         elif distance_type == 'cosine':
-            self.distance = lambda anchor, targets: 1.0 - nn.CosineSimilarity()(anchor, target)
+            self.distance = lambda anchor, targets: 1.0 - nn.CosineSimilarity()(anchor, targets)
 
     def forward(self, anchor, positive, negative, size_average=True):
         #distance_positive = (anchor - positive).pow(2).sum(1)#.pow(.5)
@@ -175,60 +175,6 @@ class AAEME(AEME):
 
             loss_constrains = self.calc_triplet_loss(encoded_meta, pos_encoded_constrains_meta, neg_encoded_constrains_meta)
 
-            return loss + loss_constrains  * self.alpha, loss, loss_constrains
-        return loss
-
-    def extract(self, inputs):
-        return self.encode(inputs)
-
-class SED(AEME):
-    def __init__(self, src_emb_shapes, aaeme_dim, wv_weights=None, alpha=0.5, margin=0.1, distance_type='mse'):
-        super(SED, self).__init__(margin, distance_type)
-        if wv_weights is None:
-            wv_weights = np.ones(len(src_emb_shapes), dtype=np.float32)
-        wv_weights = wv_weights / np.linalg.norm(wv_weights)
-        print(f'weights = {wv_weights}')
-        self.wv_weights = torch.tensor(wv_weights, dtype=torch.float32).to('cuda')
-
-        self.encoder = nn.Sequential(
-                #nn.Dropout(0.05),
-                nn.Linear(sum(src_emb_shapes), aaeme_dim),
-                nn.ReLU()
-            )
-
-        self.decoders = nn.ModuleList()
-        for src_shape in src_emb_shapes:
-            self.decoders.append(nn.Sequential(
-                nn.Dropout(0.1),
-                nn.Linear(aaeme_dim, src_shape)
-            ))
-
-    def encode(self, inputs):
-        inputs_cat = torch.cat(inputs, 1)
-        encoded_meta = self.encoder(inputs_cat)
-        encoded_meta = f.normalize(encoded_meta, dim=-1, p=2)
-        return encoded_meta
-
-    def forward(self, inputs, constrains=None, targets=None):
-        outputs = []
-        encoded_meta = self.encode(inputs)
-        for i, src_input in enumerate(inputs):
-            out = self.decoders[i](encoded_meta)
-            outputs.append(out)
-
-        loss = self.calc_loss(inputs, outputs, self.wv_weights)
-
-        if pos_constrains is not None and neg_constrains is not None:
-            pos_constrains_reshaped = [constrain_emb.view(-1, constrain_emb.shape[-1]) for constrain_emb in pos_constrains]
-            pos_encoded_constrains_meta = self.encode(pos_constrains_reshaped)
-            pos_encoded_constrains_meta = pos_encoded_constrains_meta.view(encoded_meta.shape[0], -1, encoded_meta.shape[1])
-
-            neg_constrains_reshaped = [constrain_emb.view(-1, constrain_emb.shape[-1]) for constrain_emb in neg_constrains]
-            neg_encoded_constrains_meta = self.encode(neg_constrains_reshaped)
-            neg_encoded_constrains_meta = neg_encoded_constrains_meta.view(encoded_meta.shape[0], -1, encoded_meta.shape[1])
-
-            loss_constrains = self.calc_triplet_loss(encoded_meta, pos_encoded_constrains_meta, neg_encoded_constrains_meta)
-            
             return loss + loss_constrains  * self.alpha, loss, loss_constrains
         return loss
 

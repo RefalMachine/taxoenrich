@@ -12,7 +12,9 @@ from sklearn.model_selection import KFold
 import shutil
 import os
 import sys
-
+import random
+from functools import lru_cache
+import networkx as nx
 # todo in separate file
 
 def read_dataset(data_path, read_fn=lambda x: x, sep='\t'):
@@ -26,25 +28,40 @@ def read_dataset(data_path, read_fn=lambda x: x, sep='\t'):
     return vocab
 
 
-class VectorsWithHash:
+class StaticVectorModel:
     def __init__(self, vectors):
         self.vectors = vectors
-        self.hash = {}
 
     def __contains__(self, w):
-        return w in self.vectors
+        if w in self.vectors:
+            return True
+        
+        if w.replace(' ', '_') in self.vectors:
+            return True
 
+        sep = '_' if '_' in w else ' '
+        return len([sw for sw in w.split(sep) if sw in self.vectors]) == len(w.split(sep))
+
+    def _get_vec(self, word):
+        if word in self.vectors:
+             return self.vectors[word]
+
+        if word.replace(' ', '_') in self.vectors:
+            return self.vectors[word.replace(' ', '_')]
+
+        sep = '_' if '_' in word else ' '
+        return np.mean([self.vectors[w] for w in word.split(sep)], axis=0)
+
+    @lru_cache(maxsize=32768)
     def similarity(self, w1, w2):
-        key = f'{w1}[SEP]{w2}'
-        if key in self.hash:
-            return self.hash[key]
-
-        res = self.vectors.similarity(w1, w2)
-        self.hash[key] = res
+        w1_vec = self._get_vec(w1)
+        w2_vec = self._get_vec(w2)
+        res = self.vectors.cosine_similarities(w1_vec, [w2_vec])[0]
         return res
 
     def most_similar(self, word, topn=10000):
-        return self.vectors.most_similar(word, topn=topn)
+        w_vec = self._get_vec(word)
+        return self.vectors.most_similar([w_vec], topn=topn)
 
 '''
 def load_wiktionary(wiktionary_dump_path, vectors, wkt):
@@ -56,6 +73,29 @@ def load_wiktionary(wiktionary_dump_path, vectors, wkt):
         title2docs[title] = docs_info
     return title2docs
 '''
+
+def calculate_synset_vectors(vector_model, thesaurus, black_list=[]):
+    word2vec = {}
+    for synid in tqdm(thesaurus.synsets):
+        synset = thesaurus.synsets[synid]
+        synset_word_id = f'__s{synid}'
+        synset_vectors = []
+        for word in synset.synset_words:
+            if word in vector_model and word not in black_list:
+                synset_vectors.append(vector_model._get_vec(word))
+
+        if len(synset_vectors) > 0:
+            word2vec[synset_word_id] = np.mean(synset_vectors, axis=0)
+
+    return word2vec
+
+def reinit_vector_model(model, black_list_words=[]):
+    word2vec = calculate_synset_vectors(model.vector_model, model.thesaurus, black_list_words)
+    word2vec = [(k, v) for k, v in word2vec.items()]
+    model.vector_model.vectors.add_vectors(keys=[d[0] for d in word2vec], weights=[d[1] for d in word2vec], replace=True)
+    model.vector_model.vectors.fill_norms(force=True)
+
+
 def load_wiktionary(wiktionary_dump_path, vectors):
     title2docs = {key.replace(' ', '_'): val for key, val in wkt.get_title2docs(wiktionary_dump_path).items() if key in vectors}
     for title in title2docs:
@@ -126,7 +166,6 @@ def load_word2patterns(word2patterns_path):
     return word2patterns
 
 
-
 def get_word_patterns_features(target_word, cand_word, word2patterns_syn):
     word_pattern_features = []
     if len(word2patterns_syn) > 0:
@@ -159,7 +198,8 @@ def get_synset_patterns_features(target_word, synset, word2patterns_hyp):
         synset_pattern_features += min_hyp_pattern_features.tolist()
         
     return synset_pattern_features
-            
+
+'''         
 def get_synset_bert_features(target_word, synset, bert_model, thesaurus):
     synset_bert_features = []
     if bert_model is not None:
@@ -176,7 +216,13 @@ def get_synset_bert_features(target_word, synset, bert_model, thesaurus):
         synset_bert_features += [synset_bert_prob, hyponyms_bert_prob]
         
     return synset_bert_features
-
+'''
+def get_synset_bert_features(target_word, synset, bert_model, thesaurus):
+    synset_bert_features = []
+    if bert_model is not None:
+        synset_bert_features.append(bert_model.predict(target_word, ';'.join(synset.synset_words), return_prob=True)[0][1])
+    
+    return synset_bert_features
 
 def get_synset_candidates_(cand_word, thesaurus, word_type):
     candidates = []
@@ -184,8 +230,8 @@ def get_synset_candidates_(cand_word, thesaurus, word_type):
         for synid in thesaurus.sense2synid[cand_word]:
             if thesaurus.synsets[synid].synset_type != word_type:
                 continue
-            if 'instance hypernym' in thesaurus.synsets[synid].rels:
-                continue
+            #if 'instance hypernym' in thesaurus.synsets[synid].rels:
+            #    continue
             
             for h in thesaurus.synsets[synid].rels.get('hypernym', []):
                 candidates.append([h, 1])
@@ -323,7 +369,27 @@ def train_predict_cv(df_features, ref, folds=5):
     print(f'Averaged results = {np.mean(results, axis=0)}')
     return models, features
 
-def get_score(reference, predicted, k=10):
+def get_score_list(reference, submitted, k=10):
+    print(len(reference), len(submitted))
+    random.seed(42)
+    max_items_len = int(len(reference) * 0.8)
+    all_words = list(reference)
+    map_list, mrr_list = [], []
+
+    for _ in range(30):
+        random.shuffle(all_words)
+        _80_percent_words = all_words[:max_items_len]
+        smaller_reference = dict(filter(lambda x: x[0] in _80_percent_words, reference.items()))
+        mean_ap, mean_rr = get_score(smaller_reference, submitted, k=k)
+        map_list.append(mean_ap)
+        mrr_list.append(mean_rr)
+
+    #write_to_file(os.path.splitext(submitted_path)[0]+"_map_scores.json", map_list)
+    #write_to_file(os.path.splitext(submitted_path)[0]+"_mrr_scores.json", mrr_list)
+
+    return map_list, mrr_list
+
+def get_score(reference, predicted, k=10, return_addition_info=False):
     ap_sum = 0
     rr_sum = 0
 
@@ -337,7 +403,10 @@ def get_score(reference, predicted, k=10):
         rr_sum += rr
         w2res[neologism] = ap
 
-    return (ap_sum / len(reference), ap_sum / len(predicted)), (rr_sum / len(reference),  rr_sum / len(predicted)), w2res
+    results = [ap_sum / len(reference), rr_sum / len(reference)]
+    if return_addition_info:
+        results.append(w2res)
+    return results
 
 
 def compute_ap(actual, predicted, k=10):
@@ -482,7 +551,7 @@ def predict_test(test_df, thesaurus, vector_model, models, features, pos, save_p
     synset_candidates = get_synset_candidates(most_sim, thesaurus, vector_model, pos, predict_synset_cand_count,
                                               word2patterns_syn, word2patterns_hyp, bert_model, wiktionary)
     test_df_features = get_features_df(synset_candidates, w2true={})
-
+    print(test_df_features.iloc[:2])
     #print('Predict')
     test_df_features[f'predict'] = [0] * test_df_features.shape[0]
     for model in models:
@@ -493,6 +562,7 @@ def predict_test(test_df, thesaurus, vector_model, models, features, pos, save_p
     test_df_features['word'] = test_df_features['word'].apply(lambda x: x.upper())
     if lang == 'en':
         test_df_features['cand'] = test_df_features['cand'].apply(lambda x: thesaurus.synsets[x].synset_name)
+    test_df_features.to_csv('temp.csv', sep='\t', index=False, header=False)
     if save_path is not None:
         create_submit_df(test_df_features).to_csv(save_path, sep='\t', index=False, header=False)
 
@@ -521,3 +591,129 @@ def create_submit_df(df, topk=10):
         counter += 1
     return pd.DataFrame({'word': target_words, 'cand': predict, 'prob': probas})
 #
+
+def create_train_dataset(thesaurus, pos, fraction, include_synset=False):
+    zero_hypo_synsets = []
+    for synset_id, synset in thesaurus.synsets.items():
+        if len(synset.rels.get('hyponym', [])) == 0 and synset.synset_type in pos and len(synset.rels.get('hypernym', [])) > 0:
+            zero_hypo_synsets.append(synset_id)
+    full_size = len([sid for sid, s in thesaurus.synsets.items() if s.synset_type in pos])
+    train_size = int(full_size * fraction)
+    print(f'Estimated train size {train_size}')
+
+    train_synsets = np.random.choice(zero_hypo_synsets, train_size)
+    
+    target_words = []
+    target_synsets = []
+    target_gold = []
+
+    for sid in tqdm(train_synsets):
+        synset = thesaurus.synsets[sid]
+        w_candidates = [w for w in synset.synset_words if len(thesaurus.sense2synid[w]) < 3]
+        if len(w_candidates) == 0:
+            continue
+        tw = np.random.choice(w_candidates, 1)[0]
+        synsets = thesaurus.sense2synid[tw]
+
+        target_words.append(tw.lower())
+        synsets = [sid for sid in thesaurus.sense2synid[tw] if thesaurus.synsets[sid].synset_type in pos]
+        if len(synsets) == 0:
+            continue
+        target_synsets.append(synsets)
+        direct_hypernyms = []
+        for s in synsets:
+            direct_hypernyms += thesaurus.synsets[s].rels.get('hypernym', [])
+
+        tw_gold = []
+        if include_synset:
+            tw_gold.append([sid])
+        for h_id in direct_hypernyms:
+            h = thesaurus.synsets[h_id]
+            if h.synset_type not in pos:
+                continue
+            cur_gold = [h.synset_id]
+            for hh_id in h.rels.get('hypernym', []):
+                hh = thesaurus.synsets[hh_id]
+                if hh.synset_id not in cur_gold and hh.synset_type in pos:
+                    cur_gold += [hh.synset_id]
+            tw_gold.append(cur_gold)
+            
+        target_gold.append(tw_gold)
+
+    print(f'Train size {len(target_words)}')
+    df = pd.DataFrame({'word': target_words, 'target_synset': target_synsets, 'target_gold': target_gold})
+    return df
+
+
+def create_graph(thesaurus, pos, allowed_rels):
+    G = nx.DiGraph()
+    nodes = [sid for sid in thesaurus.synsets if thesaurus.synsets[sid].synset_type in pos]
+    nodes_set = set(nodes)
+
+    G.add_nodes_from(nodes)
+    for sid in tqdm(nodes_set):
+        rels = {r: rsids for r, rsids in thesaurus.synsets[sid].rels.items() if r in allowed_rels}
+        for r in rels:
+            for rsid in rels[r]:
+                if rsid in nodes_set:
+                    G.add_edge(sid, rsid, rel_type=r)
+
+    return G
+
+def select_train_synsets(G, fraction, only_leafs=True):
+    nodes = list(G.nodes())
+    print(len(nodes))
+    nodes = [n for n in nodes if len([d for d in G.successors(n)]) > 0]
+    print(len(nodes))
+    full_size = len(nodes)
+    if only_leafs:
+        nodes = [n for n in nodes if len([d for d in G.predecessors(n)]) == 0]
+    
+    train_size = int(full_size * fraction)
+    train_synsets = np.random.choice(nodes, train_size)
+
+    return train_synsets
+
+def create_train_dataset_broad(thesaurus, pos, allowed_rels, fraction, include_synset=True, only_leafs=True, include_second_order=True):
+    G = create_graph(thesaurus, pos, allowed_rels)
+    train_synsets = select_train_synsets(G, fraction, only_leafs=only_leafs)
+    print(f'Estimated train size {len(train_synsets)}')
+    
+    target_words = []
+    target_synsets = []
+    target_gold = []
+
+    for sid in tqdm(train_synsets):
+        synset = thesaurus.synsets[sid]
+        w_candidates = [w for w in synset.synset_words if len(thesaurus.sense2synid[w]) <= 3]
+        if len(w_candidates) == 0:
+            continue
+        tw = np.random.choice(w_candidates, 1)[0]
+        #synsets = thesaurus.sense2synid[tw]
+
+        #target_words.append(tw.lower())
+        synsets = [sid for sid in thesaurus.sense2synid[tw] if thesaurus.synsets[sid].synset_type in pos]
+        if len(synsets) == 0:
+            continue
+        #target_synsets.append(synsets)
+
+        tw_gold = []
+        for gold_sid in synsets:
+            tw_gold.append([])
+            if include_synset:
+                tw_gold[-1].append(gold_sid)
+
+            direct_rels = list(G[gold_sid])
+            tw_gold[-1] += [sid for sid in direct_rels if sid not in tw_gold[-1]]
+            if include_second_order:
+                for rsid in direct_rels:
+                    second_order_rels = list(G[rsid])
+                    tw_gold[-1] += [sid for sid in second_order_rels if sid not in tw_gold[-1]]
+            
+        target_words.append(tw.lower())
+        target_synsets.append(synsets)
+        target_gold.append(tw_gold)
+
+    print(f'Train size {len(target_words)}')
+    df = pd.DataFrame({'word': target_words, 'target_synset': target_synsets, 'target_gold': target_gold})
+    return df

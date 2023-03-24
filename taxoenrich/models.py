@@ -1,459 +1,502 @@
+from functools import lru_cache
 import os
 import codecs
 import json
 from tqdm import tqdm
-import pymorphy2
-import xml.etree.ElementTree as ET
-from transformers import BertForSequenceClassification, BertTokenizerFast
-import torch
-import numpy as np
-import pickle
 import codecs
-
-class SynSet:
-    def __init__(self, synset_id, synset_name, synset_type, words):
-        self.synset_type = synset_type
-        self.synset_name = synset_name
-        self.synset_id = synset_id
-        self.synset_words = words
-        self.rels = {}
-        self.total_hyponyms = None
-
-    def add_rel(self, synset, rel_type):
-        if rel_type not in self.rels:
-            self.rels[rel_type] = []
-
-        self.rels[rel_type].append(synset)
-
-    def _calc_total_hyponyms(self):
-        if self.total_hyponyms is not None:
-            return self.total_hyponyms
-
-        hyponym_list = self.rels.get('hyponym', [])
-        self.total_hyponyms = len(hyponym_list) + sum(list(map(lambda x: x._calc_total_hyponyms(), hyponym_list)))
-
-        return self.total_hyponyms
+from multiprocessing import Pool
+import pandas as pd
+import numpy as np
+import joblib
+import gensim
+from collections import OrderedDict
+from taxoenrich.utils import StaticVectorModel, LogRegScaler, get_score, create_graph, reinit_vector_model
+from taxoenrich.core import EnWordNet, RuWordNet, RuThes
+from sklearn.model_selection import KFold
+from sklearn.metrics import roc_auc_score
 
 
-class WordNet:
-    def __init__(self):
-        self.synsets = {}
-        self.senses = set()
-        self.sense2synid = {}
+class HypernymPredictModel():
+    def __init__(self, config):
+        self.config = config
+        self._init_model_state(config)
+        self._load_resources(config)
 
-    def _calc_synset_children(self):
-        for synset_id in self.synsets:
-            try:
-                self.synsets[synset_id]._calc_total_hyponyms()
-            except:
-                print(synset_id)
-        top_synsets = []
-        for synset_id in self.synsets:
-            hypernym_count = len(self.synsets[synset_id].rels.get('hypernym', []))
-            if hypernym_count == 0:
-                top_synsets.append(synset_id)
+    def train(self, train_df):
+        if not self.config['include_synset']:
+            self.thesaurus.filter_synsets_with_words(train_df['word'])
 
-    def filter_thesaurus(self, words):
-        for w in words:
-            if w not in self.sense2synid:
-                continue
-            synsets_ids = self.sense2synid[w]
-            for synset_id in synsets_ids:
-                try:
-                    synset = self.synsets[synset_id]
-                    parents = synset.rels.get('hypernym', [])
-                    childs = synset.rels.get('hyponym', [])
-                    for parent_synset in parents:
-                        del parent_synset.rels['hyponym'][parent_synset.rels['hyponym'].index(synset)]
-                    for child_synset in childs:
-                        del child_synset.rels['hypernym'][child_synset.rels['hypernym'].index(synset)]
+        if self.config['processes'] > 1:
+            with Pool(processes=self.config['processes']) as process_pool:
+                run_query_args = tqdm([(self, row['word'], row['def'] if 'def' in row else '') for i, row in train_df.iterrows()], total=len(train_df['word']))
+                features = process_pool.starmap(HypernymPredictModel._calculate_features, run_query_args, chunksize=128)
+        else:
+            features = []
+            for i, row in tqdm(train_df.iterrows()):
+                features.append(self._calculate_features(row['word'], row['def'] if 'def' in row else ''))
+        train_features_df = pd.concat(features).reset_index(drop=True)
 
-                    for parent_synset in parents:
-                        for child_synset in childs:
-                            if child_synset in parent_synset.rels['hyponym']:
-                                continue
-                            parent_synset.rels['hyponym'].append(child_synset)
-                            child_synset.rels['hypernym'].append(parent_synset)
+        ref, word2true = self._get_train_true_info(train_df)
+        self._add_true(train_features_df, word2true)
+        self.models, self.features = self._train_predict_cv(train_features_df, ref, 3)
 
-                    del self.synsets[synset_id]
+    def predict(self, new_words, no_pred=False, chunksize=129):
+        if self.config['processes'] > 1:
+            with Pool(processes=self.config['processes']) as process_pool:
+                run_query_args = tqdm([(self, word) for word in new_words], total=len(new_words))
+                features = process_pool.starmap(HypernymPredictModel._calculate_features, run_query_args, chunksize=chunksize)
+                print('ok')
+        else:
+            features = []
+            for word in tqdm(new_words):
+                features.append(self._calculate_features(word))
+        if no_pred:
+            return None
 
-                    for sense in synset.synset_words:
-                        if sense in self.senses:
-                            self.senses.remove(sense)
-                        if sense in self.sense2synid:
-                            del self.sense2synid[sense]
-                except Exception as e:
-                    print(synset_id)
-                    print(e)
-        #self._calc_synset_children()
+        features = [f for f in features if f is not None]
+        if len(features) == 0:
+            return None
+        test_features_df = pd.concat(features).reset_index(drop=True)
 
-class EnWordNet(WordNet):
-    def __init__(self, wordnet_root):
-        super().__init__()
-        self.rel_map = {
-            '@': 'hypernym',
-            '@i': 'hypernym',
-            '~': 'hyponym',
-            '~i': 'hyponym'
-            }
-        self._load_wordnet(wordnet_root)
+        test_features_df[f'predict'] = [0] * test_features_df.shape[0]
+        for model in self.models:
+            test_features_df[f'predict'] += model.predict_proba(test_features_df[self.features])[:,1]
+        test_features_df[f'predict'] /= len(self.models)
 
-    def _load_wordnet(self, wordnet_root):
-        self._load_synsets(wordnet_root)
-        #self._calc_synset_children()
+        test_features_df = test_features_df.sort_values(by=['word', 'predict'], ascending=False)
+        test_features_df['word'] = test_features_df['word'].apply(lambda x: x.upper())
+        test_features_df['cand_name'] = test_features_df['cand'].apply(lambda x: self.thesaurus.synsets[x].synset_name)
 
-    def _load_index(self, wordnet_root):
-        synsets_paths = {
-            'N': os.path.join(wordnet_root, os.path.join('dict', 'index.noun')),
-            'A': os.path.join(wordnet_root, os.path.join('dict', 'index.adj')),
-            'V': os.path.join(wordnet_root, os.path.join('dict', 'index.verb')),
-            'R': os.path.join(wordnet_root, os.path.join('dict', 'index.adv')),
-        }
+        return self._create_predict_df(test_features_df)
 
-        index = {t: {} for t in synsets_paths}
-        for synset_type, synset_path in synsets_paths.items():
-            with codecs.open(synset_path, 'r', 'utf-8') as file:
-                for line in file:
-                    if line.startswith('\t') or line.startswith(' '):
-                        continue
-                    line_content = line.strip().split()
-                    word = line_content[0]
-                    synset_count = int(line_content[2])
-                    ptr_count = int(line_content[3])
-                    index[synset_type][word] = line_content[4 + ptr_count + 2:]
-                    assert len(line_content[4 + ptr_count + 2:]) == synset_count
-
-        return index
-
-
-    def _load_synsets(self, wordnet_root, black_list_synsets=None, black_list_senses=None):
-        synsets_paths = {
-            'N': os.path.join(wordnet_root, os.path.join('dict', 'data.noun')),
-            'A': os.path.join(wordnet_root, os.path.join('dict', 'data.adj')),
-            'V': os.path.join(wordnet_root, os.path.join('dict', 'data.verb')),
-            'R': os.path.join(wordnet_root, os.path.join('dict', 'data.adv')),
-        }
-        index = self._load_index(wordnet_root)
-        for synset_type, synset_path in synsets_paths.items():
-            with codecs.open(synset_path, 'r', 'utf-8') as file:
-                for line in file:
-                    if line.startswith('\t') or line.startswith(' '):
-                        continue
-                    try:
-                        synset_info = self._read_line(line)
-                        synset_id = synset_info['id']
-                        synset_name = synset_info['name']
-                        synset_name_idx = index[synset_type][synset_name].index(synset_info['id'][:-1]) + 1
-                        synset_name = f'{synset_name}.{synset_type.lower()}.{self._to2digit(synset_name_idx)}'
-                        synset_words = synset_info['words']
-
-                    except Exception as e:
-                        print(line)
-                        raise e
-
-                    if black_list_synsets is not None and synset_id in black_list_synsets:
-                        self.synsets[synset_id] = SynSet(synset_id, synset_name, synset_type, set())
-                    else:
-                        if black_list_senses is not None:
-                            synset_words = [w for w in synset_words if w not in black_list_senses]
-
-                        self.synsets[synset_id] = SynSet(synset_id, synset_name, synset_type, set(synset_words))
-                        self.senses.update(synset_words)
-                        for sense in synset_words:
-                            if sense not in self.sense2synid:
-                                self.sense2synid[sense] = []
-                            self.sense2synid[sense].append(synset_id)
-
-                    for rel_type, rel_synset_id in synset_info['rels']:
-                        self.synsets[synset_id].add_rel(rel_synset_id, rel_type)
-
-        for synset_id in self.synsets:
-            for rel_type in self.synsets[synset_id].rels:
-                for i, rel_synset_id in enumerate(self.synsets[synset_id].rels[rel_type]):
-                    self.synsets[synset_id].rels[rel_type][i] = self.synsets[rel_synset_id]
-
-    def _read_line(self, line):
-        synset_info = {}
-
-        ID_IDX = 0
-        POS_IDX = 2
-        W_LEN_IDX = 3
-        WORDS_SHIFT = 4
-
-        line_content = line.strip().split()
-        synset_id = line_content[ID_IDX]
-        pos = line_content[POS_IDX]
-        if pos == 's':
-            pos = 'a'
-        synset_id += pos
-
-        synset_info['id'] = synset_id
-
-        synset_words_len = int(line_content[W_LEN_IDX], 16)
-        synset_words = []
+    @lru_cache(maxsize=50000)
+    def predict_one(self, word, topk=10, definition=''):
+        features = self._calculate_features(word, definition)
+        if features is None:
+            return None
         
-        for i in range(synset_words_len):
-            synset_words.append(line_content[WORDS_SHIFT + i * 2])
+        features = [features]
+        test_features_df = pd.concat(features).reset_index(drop=True)
+        test_features_df[f'predict'] = [0] * test_features_df.shape[0]
+        for model in self.models:
+            test_features_df[f'predict'] += model.predict_proba(test_features_df[self.features])[:,1]
+        test_features_df[f'predict'] /= len(self.models)
+
+        test_features_df = test_features_df.sort_values(by=['word', 'predict'], ascending=False)
+        test_features_df['word'] = test_features_df['word'].apply(lambda x: x.upper())
+        test_features_df['cand_name'] = test_features_df['cand'].apply(lambda x: self.thesaurus.synsets[x].synset_name)
+
+        return self._create_predict_df(test_features_df, topk=topk)
 
 
-        synset_info['words'] = []
-        for w in synset_words:
-            if '(' in w:
-                w = w[:w.find('(')]
-            w = w.lower()
-            if w not in synset_info['words']:
-                synset_info['words'].append(w)
+    def save(self, model_dir):
+        model_path = os.path.join(model_dir, 'model.joblib')
+        joblib.dump({'models': self.models, 'features': self.features}, model_path)
+
+        config_path = os.path.join(model_dir, 'config')
+        json.dump(self.config, codecs.open(config_path, 'w', 'utf-8'))
+     
+    @staticmethod
+    def from_pretrained(model_dir):
+        model_path = os.path.join(model_dir, 'model.joblib')
+        model_info = joblib.load(model_path)
+        models = model_info['models']
+        features = model_info['features']
+
+        config_path = os.path.join(model_dir, 'config')
+        config = json.load( codecs.open(config_path, 'r', 'utf-8'))
+
+        hypernym_model = HypernymPredictModel(config)
+        hypernym_model.models = models
+        hypernym_model.features = features
+
+        if not config.get('search_by_word', False):
+            reinit_vector_model(hypernym_model)
+
+        return hypernym_model
+
+    def _init_model_state(self, config):
+        self.word_types = config['pos']
+        self.topk = config['topk']
+        self.lang = config['lang']
+        self.search_by_word = config['search_by_word']
+
+        '''
+        self.wkt_on = config['wkt']
+        global wkt
+        if self.lang == 'en':
+            import wiktionary_processing.utils_en as wkt
+        else:
+            import wiktionary_processing.utils as wkt
+        '''
+    def _load_resources(self, config):
+        self._load_thesaurus(config)
+        self._load_vectors(config)
+        self.G = create_graph(self.thesaurus, self.word_types, self.config['allowed_rels'])
+        #self._load_wkt(config)
+
+    def _load_thesaurus(self, config):
+        print('Loading Thesaurus')
+        ThesClass = EnWordNet if config['lang'] == 'en' else RuThes if config['ruthes'] else RuWordNet
+        self.thesaurus = ThesClass(config['thesaurus_dir'])
+        
+    def _load_vectors(self, config):
+        print('Loading Vectors')
+        embeddings_path = config['embeddings_path']
+        try:
+            self.vector_model = StaticVectorModel(gensim.models.KeyedVectors.load(embeddings_path))
+        except:
+            self.vector_model = StaticVectorModel(gensim.models.KeyedVectors.load_word2vec_format(embeddings_path, binary=False))
+    '''
+    def _load_wkt(self, config):
+        self.wiktionary = {}
+        if self.wkt_on:
+            print('Loading Wiktionary')
+            self.wiktionary = wkt.load_wiktionary(config['wiktionary_dump_path'], self.vector_model)
+    '''
+    def _calculate_features(self, word, definition=''):
+        candidate2features = self._calculate_candidates(word, definition=definition)
+        if len(candidate2features) == 0:
+            return None
+        candidate_col = []
+        features = []
+        for synset_id in candidate2features:
+            if synset_id not in self.thesaurus.synsets:
+                continue
+            synset = self.thesaurus.synsets[synset_id]
+
+            init_features = self._calculate_init_features(synset_id, candidate2features)
+            #wkt_features = self._calculate_wiktionary_features(word, synset)
+            synset_features = self._calculate_synset_similarity(word, synset)
+
+            candidate_col.append(synset_id)
+            #features.append(init_features + wkt_features + synset_features)
+            features.append(init_features + synset_features)
+            if self.config['use_def']:
+                def_features = self._calculate_def_features(word, synset, definition)
+                features[-1] += def_features
+
+        features = np.array(features)
+
+        columns = OrderedDict()
+        columns['word'] = [word] * len(candidate_col)
+        columns['cand'] = candidate_col
+
+        for i in range(features.shape[1]):
+            columns[f'f{i}'] = features[:,i]
+
+        df = pd.DataFrame(columns)
+        #df = df.sort_values(by='f6', ascending=False)
+        #df = df.iloc[:self.topk]
+        #print(df[['word', 'cand', 'f0', 'f1', 'f2', 'f3', 'f4', 'f5', 'f6', 'f7', 'f8']].head(10))
+        #exit(1)
+        return df
+
+    def _calculate_def_features(self, word, synset, definition):
+        features = [0, 0]
+        definition = definition.lower().replace(' ', '_')
+        for synset_word in synset.synset_words:
+            if synset_word in definition:
+                features[0] = 1
+            if synset_word in '_'.join(definition.split('_')[:5]):
+                features[1] = 1
+        return features
+
+    def _calculate_candidates(self, word, definition=''):
+        
+        if word not in self.vector_model:
+            return {}
+        most_similar_words = self.vector_model.most_similar(word, topn=10000) # must be larger then topk
+        
+        if self.search_by_word:
+            most_similar_words = self._filter_most_sim_by_type(word, most_similar_words)
+            most_similar_words = most_similar_words[:self.topk]
+
+            candidates = []
+            for cand_word, similarity in most_similar_words:
+                if cand_word in self.thesaurus.sense2synid:
+                    for synid in self.thesaurus.sense2synid[cand_word]:
+                        if self.thesaurus.synsets[synid].synset_type not in self.word_types:
+                            continue
+                        
+                        candidates.append([synid, 0, similarity])
+                        for rsid in self.G[synid]:
+                            candidates.append([rsid, 1, similarity])
+                            for rrsid in self.G[rsid]:
+                                candidates.append([rrsid, 2, similarity])
+                        '''
+                        for hid in self.thesaurus.synsets[synid].rels.get('hypernym', []):
+                            candidates.append([hid, 1, similarity])
+                            h = self.thesaurus.synsets[hid]
+                            for hhid in h.rels.get('hypernym', []):
+                                candidates.append([hhid, 2, similarity])
+                        '''
+            definition = definition.lower().replace(' ', '_')
+            for cand_word in definition.split('_'):
+                if cand_word in self.vector_model and cand_word in self.thesaurus.sense2synid:
+                    for synid in self.thesaurus.sense2synid[cand_word]:
+                        if self.thesaurus.synsets[synid].synset_type not in self.word_types:
+                            continue
+                        
+                        candidates.append([synid, 0, self.vector_model.similarity(word, cand_word)])
+        else:
+            most_similar_words = self._filter_most_sim(word, most_similar_words)
+            most_similar_words = most_similar_words[:self.topk]
+            candidates = []
+            for synid, _ in most_similar_words:
+                if self.thesaurus.synsets[synid].synset_type not in self.word_types:
+                    continue
+                
+                candidates.append([synid, 0])
+                for hid in self.thesaurus.synsets[synid].rels.get('hypernym', []):
+                    candidates.append([hid, 1])
+                    h = self.thesaurus.synsets[hid]
+                    for hhid in h.rels.get('hypernym', []):
+                        candidates.append([hhid, 2])
+                            
+        
+        candidate2features = {}
+        for cand_info in candidates:
+            synset_id = cand_info[0]
+            features = cand_info[1:]
+            if synset_id not in candidate2features:
+                candidate2features[synset_id] = [0]
+                for f in features:
+                    candidate2features[synset_id].append([])
+
+            candidate2features[synset_id][0] += 1
+            for i, f in enumerate(features):
+                candidate2features[synset_id][i + 1].append(f)
+
+        return candidate2features
+
+
+    def _calculate_init_features(self, synset_id, candidate2features):
+        features = []
+        init_features = candidate2features[synset_id]
+
+        features.append(init_features[0])
+        features.append(np.log2(2 + init_features[0]))
+
+        features.append(np.min(init_features[1]))
+        features.append(np.mean(init_features[1]))
+        features.append(np.max(init_features[1]))
+
+        return features
+
+    '''
+    def _calculate_wiktionary_features(self, target_word, synset):
+        # 1 feature for direct syn, 1 feature for hypo syn, 1 feature for direct hyper, 1 feature for hypo hyper
+        if len(self.wiktionary) == 0:
+            return []
+        
+        features = [0] * 6
+        direct_syn_feature_idx = 0
+        hypo_syn_feature_idx = 1
+        direct_hyper_feature_idx = 2
+        hypo_hyper_feature_idx = 3
+        direct_meaning_feature_idx = 4
+        hypo_meaning_feature_idx = 5
+
+        def get_all_wkt(word, wiktionary, tag):
+            all_words = set([word])
+            for wikt_doc_info in wiktionary.get(word, []):
+                all_words.update(wikt_doc_info[tag])
+            return all_words
+
+        tw_synonyms = get_all_wkt(target_word, self.wiktionary, 'synonym')
+        tw_hypernyms = get_all_wkt(target_word, self.wiktionary, 'hypernym')
+        tw_meaning = []
+        for wikt_doc_info in self.wiktionary.get(target_word, []):
+            tw_meaning.append('_'.join(wikt_doc_info['meaning']).replace(' ', '_'))
+        tw_meaning = '_'.join(tw_meaning)
+
+        synset_synonyms = set()
+        for word in synset.synset_words:
+            synset_synonyms.update(get_all_wkt(word, self.wiktionary, 'synonym'))
+
+        hypo_synonyms = set()
+        hypo_words = set()
+        for hypoid in synset.rels.get('hyponym', []):
+            hypo = self.thesaurus.synsets[hypoid]
+            hypo_words.update(hypo.synset_words)
+            for word in hypo.synset_words:
+                hypo_synonyms.update(get_all_wkt(word, self.wiktionary, 'synonym'))
+
+        features[direct_syn_feature_idx] = int(len(tw_synonyms.intersection(synset_synonyms)) > 0)
+        features[hypo_syn_feature_idx] = int(len(tw_synonyms.intersection(hypo_synonyms)) > 0)
+        features[direct_hyper_feature_idx] = int(len(tw_hypernyms.intersection(set(synset.synset_words))) > 0)
+        features[hypo_hyper_feature_idx] = int(len(tw_hypernyms.intersection(hypo_words)) > 0)
+
+        for w in synset_synonyms:
+            if w in tw_meaning:
+                features[direct_meaning_feature_idx] = 1
+
+        for w in hypo_synonyms:
+            if w in tw_meaning:
+                features[hypo_meaning_feature_idx] = 1
+
+        return features
+    '''
+    def _calculate_synset_similarity(self, w, synset):
+        f_lists = [[], [], [], []]
+        for synset_word in synset.synset_words:
+            if synset_word in self.vector_model:
+                f_lists[0].append(self.vector_model.similarity(w, synset_word))
+        for hypoid in synset.rels.get('hyponym', []):
+            hyponym = self.thesaurus.synsets[hypoid]
+            hyponym_sim = []
+            for synset_word in hyponym.synset_words:
+                if synset_word in self.vector_model:
+                    hyponym_sim.append(self.vector_model.similarity(w, synset_word))
+            if len(hyponym_sim) == 0:
+                hyponym_sim.append(0)
+            f_lists[1].append(np.max(hyponym_sim))
+            f_lists[2].append(np.mean(hyponym_sim))
+            f_lists[3].append(np.min(hyponym_sim))
+        results = []
+        for f_list in f_lists:
+            if len(f_list) == 0:
+                f_list.append(0)
+            results.append(np.max(f_list))
+            results.append(np.mean(f_list))
+            results.append(np.min(f_list))
+        return results
+
+    @staticmethod
+    def _get_train_true_info(train_df):
+        reference = {}
+        w2true = {}
+        for _, row in train_df.iterrows():
+            word = row['word']
+            if type(row['target_gold']) == str:
+                target_gold = json.loads(row['target_gold'])
+            else:
+                target_gold = row['target_gold']
+            reference[word] = target_gold
+            w2true[word] = set()
+            for t in target_gold:
+                w2true[word].update([str(c) for c in t])
+
+        return reference, w2true
+
+    @staticmethod
+    def _add_true(df, word2true):
+        true_col = []
+        for i, row in df.iterrows():
+            word = row['word']
+            cand = row['cand']
+            label = int(cand in word2true[word])
+            true_col.append(label)
+
+        df['label'] = true_col
+
+    def _train_predict_cv(self, df_features, ref, folds=3):
+        non_features_col_num = 3
+        features_len = len(df_features.columns) - non_features_col_num
+        features = [f'f{i}' for i in range(features_len)]
+        print(df_features.shape[0], df_features['label'].sum())
+        kf = KFold(n_splits=folds)
+
+        results = []
+        models = []
+        for train_index, test_index in kf.split(df_features['word'].unique()):
+            train_words = df_features['word'].unique()[train_index]
+            test_words = df_features['word'].unique()[test_index]
+
+            train_df = df_features[df_features['word'].apply(lambda x: x in train_words)]
+            test_df = df_features[df_features['word'].apply(lambda x: x in test_words)]
+
+            clf = LogRegScaler()
+
+            X_train = train_df[features]
+            X_test = test_df[features]
+            y_train = train_df['label']
+            y_test = test_df['label']
+
+            clf.fit(X_train, y_train)
+            y_pred = clf.predict_proba(X_test)
+
+            test_df['predict'] = y_pred[:,1]
+            roc_auc = roc_auc_score(y_test, y_pred[:,1])
+            test_df = test_df.sort_values(by=['word', 'predict'], ascending=False)
+
+            cur_ref = {w: ref[w] for w in ref if w in set(test_words)}
+            mean_ap, mean_rr = get_score(cur_ref, self._from_df_to_pred(test_df), k=10)
+            eval_res = [mean_ap, mean_rr, roc_auc]
+
+            models.append(clf)
+
+            print(eval_res)
+            results.append(eval_res)
+
+        print(f'Averaged results = {np.mean(results, axis=0)}')
+        return models, features
+
+    def _filter_most_sim_by_type(self, word, most_similar_words):
+        filtered_word_list = []
+        banned_words = set()
+        for synid in self.thesaurus.sense2synid.get(word, []):
+            synset = self.thesaurus.synsets[synid]
+            banned_words.update(synset.synset_words)
+
+        for w, score in most_similar_words:
+            w = w.replace('ё', 'е')
+            if w not in self.thesaurus.sense2synid:
+                continue
+
+            if w in banned_words:
+                continue
+
+            found_sense = False
+            for synid in self.thesaurus.sense2synid[w]:
+                if self.thesaurus.synsets[synid].synset_type in self.word_types:
+                    found_sense = True
+
+            if found_sense is True:
+                filtered_word_list.append([w, score])
+
+        return filtered_word_list
+
+    def _filter_most_sim(self, word, most_similar_words):
+        filtered_word_list = []
+        for w, score in most_similar_words:
+            if not w.startswith('__s'):
+                continue
             
-        synset_name = synset_info['words'][0]
-        synset_info['name'] = synset_name
+            synid = w[len('__s'):]
+            if synid in self.thesaurus.synsets and self.thesaurus.synsets[synid].synset_type in self.word_types:
+                filtered_word_list.append([synid, score])
 
-        RELS_SHIFT = WORDS_SHIFT + synset_words_len * 2 + 1
-        rels_count = int(line_content[RELS_SHIFT - 1])
-        cur_rel_shift = RELS_SHIFT
-        rels = []
-        while len(rels) != rels_count and cur_rel_shift < len(line_content) - 2 and line_content[cur_rel_shift] != '|':
-            rel_type = self.rel_map.get(line_content[cur_rel_shift], line_content[cur_rel_shift])
+        return filtered_word_list
 
-            rel_synset_id = line_content[cur_rel_shift + 1]
-            pos = line_content[cur_rel_shift + 2]
-            if pos == 's':
-                pos = 'a'
-            rel_synset_id += pos
-            rels.append((rel_type, rel_synset_id))
+    @staticmethod
+    def _from_df_to_pred(df):
+        pred = {}
+        for i, row in df.iterrows():
+            word = row['word']
+            if word not in pred:
+                pred[word] = []
+            cand = str(row['cand'])
+            pred[word].append(cand)
+        return pred
 
-            cur_rel_shift += 4
-            '''
-            while cur_rel_shift < len(line_content)  - 2 and line_content[cur_rel_shift] == '+':
-                rel_synset_id = line_content[cur_rel_shift + 1]
-                pos = line_content[cur_rel_shift + 2]
-                if pos == 's':
-                    pos = 'a'
-                rel_synset_id += pos
-                rels.append((rel_type, rel_synset_id))
-                cur_rel_shift += 4
-            '''
-        assert len(rels) == rels_count
-        rels = [rel for rel in rels if rel[1][-1] == synset_id[-1]]
-        synset_info['rels'] = rels
-
-        return synset_info
-
-    def _to2digit(self, num):
-        return '0' * (2 - len(str(num))) + str(num)
-
-
-class RuWordNet(WordNet):
-    def __init__(self, wordnet_root):
-        super().__init__()
-        self._load_wordnet(wordnet_root)
-
-    def _load_wordnet(self, wordnet_root):
-        self._load_synsets(wordnet_root)
-        self._load_rels(wordnet_root)
-        #self._calc_synset_children()
-
-    def _load_synsets(self, wordnet_root, black_list_synsets=None, black_list_senses=None):
-        synsets_paths = {
-            'N': os.path.join(wordnet_root, 'synsets.N.xml'),
-            'A': os.path.join(wordnet_root, 'synsets.A.xml'),
-            'V': os.path.join(wordnet_root, 'synsets.V.xml')
-        }
-
-        morph_analizer = pymorphy2.MorphAnalyzer()
-        for synset_type, synset_path in synsets_paths.items():
-            root = ET.parse(synset_path).getroot()
-            for synset in root.getchildren():
-                synset_name = synset.attrib['ruthes_name'].lower()
-                synset_id = synset.attrib['id']
-                if black_list_synsets is not None and synset_id in black_list_synsets:
-                    self.synsets[synset_id] = SynSet(synset_id, synset_name, synset_type, set())
-                    continue
-                synset_words = set()
-                for sense in synset.getchildren():
-                    word = sense.text.lower().replace('ё', 'е')
-                    split_word = word.split()
-                    split_word = [morph_analizer.parse(w)[0].normal_form.replace('ё', 'е') for w in split_word]
-                    sense = '_'.join(split_word)
-                    if black_list_senses is not None and sense in black_list_senses:
-                        continue
-                    synset_words.add(sense)
-
-                self.senses.update(synset_words)
-                self.synsets[synset_id] = SynSet(synset_id, synset_name, synset_type, synset_words)
-                for sense in synset_words:
-                    if sense not in self.sense2synid:
-                        self.sense2synid[sense] = []
-                    self.sense2synid[sense].append(synset_id)
-
-    def _load_rels(self, wordnet_root):
-        synsets_rels_paths = {
-            'N': os.path.join(wordnet_root, 'synset_relations.N.xml'),
-            'A': os.path.join(wordnet_root, 'synset_relations.A.xml'),
-            'V': os.path.join(wordnet_root, 'synset_relations.V.xml')
-        }
-
-        for synset_rel_type, synset_rels_path in synsets_rels_paths.items():
-            root = ET.parse(synset_rels_path).getroot()
-            for synset_rel in root.getchildren():
-                synset_id = synset_rel.attrib['parent_id']
-                rel_synset_id = synset_rel.attrib['child_id']
-                rel_type = synset_rel.attrib['name']
-                if rel_type not in ['hyponym', 'hypernym', 'instance hypernym']:
-                    continue
-
-                if rel_type == 'instance hypernym':
-                    rel_type = 'hypernym'
-
-                if synset_id not in self.synsets or rel_synset_id not in self.synsets:
-                    continue
-
-                self.synsets[synset_id].add_rel(self.synsets[rel_synset_id], rel_type)
-
-class RuThes(WordNet):
-    def __init__(self, concepts_path):
-        super().__init__()
-        self._load_synsets(concepts_path)
-        self._load_rels(concepts_path)
-        self._calc_hypo_rels()
-
-    def _load_synsets(self, concepts_path):
-        with codecs.open(concepts_path, 'r', 'utf-8') as file:
-            for line in tqdm(file):
-                concept_info = json.loads(line)
-                self._add_concept(concept_info)
-
-    def _load_rels(self, concepts_path):
-        with codecs.open(concepts_path, 'r', 'utf-8') as file:
-            for line in tqdm(file):
-                concept_info = json.loads(line)
-                self._add_rel(concept_info)
-
-
-    def _add_concept(self, concept_info):
-        synset_id = concept_info['conceptid']
-        synset_name = concept_info['conceptstr']
-        synset_words = concept_info['synonyms']
-
-        #concept_domain = concept_info['domainmask']
-
-        synset_type = 'N' # todo calculate POS
-
-        #print(synset_words)
-
-        #[{'textentryid': 1149044, 'textentrystr': 'ФРЕЙМВОРК APACHE MAVEN', 'lementrystr': 'ФРЕЙМВОРК APACHE MAVEN', 'isambig': '0', 'isarguable': '0'}, {'textentryid': 1149958, 'textentrystr': 'MAVEN', 'lementrystr': 'MAVEN', 'isambig': '0', 'isarguable': '0'}, {'textentryid': 1167907, 'textentrystr': 'APACHE MAVEN', 'lementrystr': 'APACHE MAVEN', 'isambig': '0', 'isarguable': '0'}]
-        synset_words = [sense_info['lementrystr'].lower().replace(' ', '_') for sense_info in synset_words]
-        self.senses.update(synset_words)
-        self.synsets[synset_id] = SynSet(synset_id, synset_name, synset_type, synset_words)
-        for sense in synset_words:
-            if sense not in self.sense2synid:
-                self.sense2synid[sense] = []
-            self.sense2synid[sense].append(synset_id)
-
-    def _add_rel(self, concept_info):
-        synset_id = concept_info['conceptid']
-        for rel in concept_info['relats']:
-            if rel['relationstr'] == 'ВЫШЕ':
-                self.synsets[synset_id].add_rel(self.synsets[rel['conceptid']], 'hypernym')
-
-    def _calc_hypo_rels(self):
-        for synset_id, synset in tqdm(self.synsets.items()):
-            for hyper in synset.rels.get('hypernym', []):
-                hyper.add_rel(self.synsets[synset_id], 'hyponym')
-
-
-class BertCls():
-    def __init__(self, model_dir, max_length=16, no_cuda=False, max_bs=256, sent_mode=False):
-        self.tokenizer = BertTokenizerFast.from_pretrained(model_dir, do_lower_case=False)
-        self.no_cuda = no_cuda
-        self.device = torch.device("cpu") if self.no_cuda else torch.device("cuda")
-        self.model_dir = model_dir
-        self.model = BertForSequenceClassification.from_pretrained(model_dir).to(self.device)
-        self.max_length = max_length
-        self.max_bs = max_bs
-        self.sent_mode = False
-        self.hash = {}
-        if os.path.exists(os.path.join(model_dir, '.hash')):
-            print('Load hash')
-            self.hash = pickle.load(codecs.open(os.path.join(model_dir, '.hash'), 'rb'))
-        self.model.eval()
-
-    def save_hash(self):
-        pickle.dump(self.hash, codecs.open(os.path.join(self.model_dir, '.hash'), 'wb'))
-
-    def predict(self, target_word, cand_word, return_prob=False):
-        key = ' '.join([target_word, cand_word])
-        if key in self.hash:
-            if return_prob is True:
-                return self.hash[key]
-            else:
-                return np.argmax(self.hash[key], axis=1)
-
-        with torch.no_grad():
-            input_ids, attention_mask, token_type_ids = self._tokenize(target_word, cand_word)
-            model_input = {"input_ids": torch.tensor(input_ids).view(1, -1).to(self.device),
-                  "attention_mask": torch.tensor(attention_mask).view(1, -1).to(self.device),
-                  "token_type_ids": torch.tensor(token_type_ids).view(1, -1).to(self.device)}
-            output = self.model(**model_input)[0]
-            probs = torch.nn.functional.softmax(output, dim=1).detach().cpu().numpy()
-        self.hash[key] = probs
-        if return_prob is True:
-            return probs
-        else:
-            return np.argmax(probs, axis=1)
-
-    def _tokenize(self, target_word, cand_word):
-        pad_token = self.tokenizer.convert_tokens_to_ids([self.tokenizer.pad_token])[0]
-        sent = f'Понятие {target_word} - это тип понятия {cand_word}'
-        if self.sent_mode is True:
-            inputs = self.tokenizer.encode_plus(sent, add_special_tokens=True, max_length=self.max_length,)
-        else:
-            inputs = self.tokenizer.encode_plus(target_word, cand_word, add_special_tokens=True, max_length=self.max_length,)
-        input_ids, token_type_ids = inputs["input_ids"], inputs["token_type_ids"]
-        attention_mask = [1] * len(input_ids)
-        padding_length = self.max_length - len(input_ids)
-        input_ids = input_ids + ([pad_token] * padding_length)
-        attention_mask = attention_mask + ([0] * padding_length)
-        token_type_ids = token_type_ids + ([0] * padding_length)
-
-        return input_ids, attention_mask, token_type_ids
-        '''
-        inputs = {"input_ids": torch.tensor(input_ids).view(1, -1),
-                  "attention_mask": torch.tensor(attention_mask).view(1, -1),
-                  "token_type_ids": torch.tensor(token_type_ids).view(1, -1)}
-        return inputs
-        '''
-
-    def predict_multiple(self, target_word, cand_words, return_prob=False):
-        key = ' '.join([target_word] + sorted(cand_words))
-        if key in self.hash:
-            if return_prob is True:
-                return self.hash[key]
-            else:
-                return np.argmax(self.hash[key], axis=1)
-        probs = []
-        batch_count = len(cand_words) // self.max_bs
-        if batch_count  != len(cand_words) / self.max_bs:
-            batch_count += 1
-
-        for i in range(batch_count):
-            batch_cand_words = cand_words[i * self.max_bs: min((i+1) * self.max_bs, len(cand_words))]
-            total_input_ids, total_attention_mask, total_token_type_ids = [], [], []
-            for cand_word in batch_cand_words:
-                input_ids, attention_mask, token_type_ids = self._tokenize(target_word, cand_word)
-                total_input_ids.append(input_ids)
-                total_attention_mask.append(attention_mask)
-                total_token_type_ids.append(token_type_ids)
-            model_input = {"input_ids": torch.tensor(total_input_ids).to(self.device),
-                    "attention_mask": torch.tensor(total_attention_mask).to(self.device),
-                    "token_type_ids": torch.tensor(total_token_type_ids).to(self.device)}
-            with torch.no_grad():
-                output = self.model(**model_input)[0]
-                batch_probs = torch.nn.functional.softmax(output, dim=1)
-            probs.append(batch_probs.detach().cpu().numpy())
-
-        probs = np.vstack(probs)
-
-        self.hash[key] = probs
-        if return_prob is True:
-            return probs
-        return np.argmax(probs, axis=1)
+    @staticmethod
+    def _create_predict_df(df, topk=10):
+        target_words = []
+        predict = []
+        probas = []
+        cand_names = []
+        counter = 0
+        last_w = ''
+        for i, row in df.iterrows():
+            if row['word'] != last_w:
+                counter = 0
+                last_w = row['word']
+            if counter < topk:
+                target_words.append(row['word'].upper())
+                predict.append(row['cand'])
+                probas.append(row['predict'])
+                cand_names.append(row['cand_name'])
+            counter += 1
+        return pd.DataFrame({'word': target_words, 'cand': predict, 'cand_name': cand_names, 'prob': probas})
