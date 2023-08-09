@@ -20,8 +20,10 @@ if __name__ == '__main__':
     parser.add_argument('--include_synset', action='store_true')
     parser.add_argument('--only_leafs', action='store_true')
     parser.add_argument('--include_second_order', action='store_true')
-    parser.add_argument('--use_def', action='store_true' )
+    parser.add_argument('--use_def', action='store_true')
     parser.add_argument('--topk', default=40, type=int)
+    parser.add_argument('--wkt', action='store_true')
+    parser.add_argument('--wiktionary_dump_path')
     args = parser.parse_args()
 
     config = {
@@ -35,7 +37,9 @@ if __name__ == '__main__':
         'thesaurus_dir': args.thesaurus_dir,
         'allowed_rels': args.allowed_rels,
         'include_synset': args.include_synset,
-        'use_def': args.use_def
+        'use_def': args.use_def,
+        'wkt': args.wkt,
+        'wiktionary_dump_path': args.wiktionary_dump_path
     }
     print(args)
     model = HypernymPredictModel(config)
