@@ -1,5 +1,5 @@
 import argparse
-from model import CAEME, AAEME, SED
+from model import CAEME, AAEME
 import torch
 from torch.utils.data import TensorDataset, DataLoader, SequentialSampler, RandomSampler, Dataset
 import gensim
@@ -14,6 +14,9 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import normalize
 from scipy.sparse.linalg import svds, eigs
 
+import sys
+sys.path.append(r'D:\WorkFolderNew\projects')
+sys.path.append(r'D:\WorkFolderNew\projects\taxoenrich')
 from taxoenrich.models import RuWordNet, EnWordNet, RuThes
 
 lang = ''
@@ -141,9 +144,9 @@ def create_dataset(vocab, full_matrix, indices=None, thes_constrains=False, thes
             for synid in sense2synid[w]:
                 pos_constrains += [word2id[synset_w] for synset_w in thesaurus.synsets[synid].synset_words if synset_w != w and synset_w in word2id]
             for hypo in thesaurus.synsets[synid].rels.get('hyponym', []):
-                pos_constrains += [word2id[synset_w] for synset_w in hypo.synset_words if synset_w != w and synset_w in word2id]
+                pos_constrains += [word2id[synset_w] for synset_w in thesaurus.synsets[hypo].synset_words if synset_w != w and synset_w in word2id]
             for hyper in thesaurus.synsets[synid].rels.get('hypernym', []):
-                pos_constrains += [word2id[synset_w] for synset_w in hyper.synset_words if synset_w != w and synset_w in word2id]
+                pos_constrains += [word2id[synset_w] for synset_w in thesaurus.synsets[hyper].synset_words if synset_w != w and synset_w in word2id]
 
         pos_constrains = list(set(pos_constrains))
         all_pos_constrains.append(pos_constrains)
