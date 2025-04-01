@@ -33,14 +33,14 @@ class StaticVectorModel:
         self.vectors = vectors
 
     def __contains__(self, w):
-        if w in self.vectors:
+        if w in self.vectors and sum(self.vectors[w]) != 0.0:
             return True
         
-        if w.replace(' ', '_') in self.vectors:
+        if w.replace(' ', '_') in self.vectors and sum(self.vectors[w.replace(' ', '_')]) != 0.0:
             return True
 
         sep = '_' if '_' in w else ' '
-        return len([sw for sw in w.split(sep) if sw in self.vectors]) == len(w.split(sep))
+        return len([sw for sw in w.split(sep) if sw in self.vectors and sum(self.vectors[sw]) != 0.0]) == len(w.split(sep))
 
     def _get_vec(self, word):
         if word in self.vectors:
@@ -56,11 +56,15 @@ class StaticVectorModel:
     def similarity(self, w1, w2):
         w1_vec = self._get_vec(w1)
         w2_vec = self._get_vec(w2)
+        if np.linalg.norm(w1_vec) == 0.0 or np.linalg.norm(w2_vec) == 0.0:
+            return 0.0
         res = self.vectors.cosine_similarities(w1_vec, [w2_vec])[0]
         return res
 
     def most_similar(self, word, topn=10000):
         w_vec = self._get_vec(word)
+        if np.linalg.norm(w_vec) == 0.0:
+            return []
         return self.vectors.most_similar([w_vec], topn=topn)
 
 '''
